@@ -60,6 +60,7 @@ sealed class SudokuUiState {
         val selectedIndex: Int?,
         val isSolved: Boolean,
         val remainingToday: Int,
+        val showTossConfirm: Boolean = false,
     ) : SudokuUiState()
 }
 
@@ -102,25 +103,56 @@ class SudokuScreenViewModel(
                 return@launch
             }
 
-            val allowed = dailyLimitStore.tryConsumePlay(GameKeys.SUDOKU)
-            if (!allowed) {
-                _state.value = SudokuUiState.LimitReached
-                return@launch
-            }
-            val remaining = dailyLimitStore.remainingPlays(GameKeys.SUDOKU)
-            val board = withContext(Dispatchers.Default) {
-                SudokuBoard.generate(SudokuDifficulty.entries.random())
-            }
-            val newState = SudokuUiState.Playing(
-                puzzle = board.puzzle,
-                solution = board.solution,
-                entries = board.puzzle.copyOf(),
-                selectedIndex = null,
-                isSolved = false,
-                remainingToday = remaining,
-            )
-            _state.value = newState
-            persistActivePuzzle(newState)
+            generateAndShowNewPuzzle()
+        }
+    }
+
+    private suspend fun generateAndShowNewPuzzle() {
+        val allowed = dailyLimitStore.tryConsumePlay(GameKeys.SUDOKU)
+        if (!allowed) {
+            _state.value = SudokuUiState.LimitReached
+            return
+        }
+        val remaining = dailyLimitStore.remainingPlays(GameKeys.SUDOKU)
+        val board = withContext(Dispatchers.Default) {
+            SudokuBoard.generate(SudokuDifficulty.entries.random())
+        }
+        val newState = SudokuUiState.Playing(
+            puzzle = board.puzzle,
+            solution = board.solution,
+            entries = board.puzzle.copyOf(),
+            selectedIndex = null,
+            isSolved = false,
+            remainingToday = remaining,
+        )
+        _state.value = newState
+        persistActivePuzzle(newState)
+    }
+
+    /** Shows the "are you sure" prompt - doesn't toss anything yet. */
+    fun requestToss() {
+        val current = _state.value as? SudokuUiState.Playing ?: return
+        if (current.isSolved) return
+        _state.value = current.copy(showTossConfirm = true)
+    }
+
+    fun cancelToss() {
+        val current = _state.value as? SudokuUiState.Playing ?: return
+        _state.value = current.copy(showTossConfirm = false)
+    }
+
+    /**
+     * The attempt stays spent either way - you already used one of today's plays the moment
+     * this puzzle was generated, same as if you'd solved it. Since there's a resume feature,
+     * it's fine to hand over a fresh puzzle immediately rather than sending the player back
+     * to the home screen - they can always back out and return to it later if they want.
+     */
+    fun confirmToss() {
+        val current = _state.value as? SudokuUiState.Playing ?: return
+        if (current.isSolved) return
+        viewModelScope.launch {
+            activePuzzleStore.clear(GameKeys.SUDOKU)
+            generateAndShowNewPuzzle()
         }
     }
 
@@ -211,9 +243,13 @@ class SudokuScreen(sealedActivity: SealedLightActivity) :
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
+                val tossButton = (state as? SudokuUiState.Playing)?.let { s ->
+                    if (s.isSolved) null else LightBarButton.LightIcon(icon = LightIcons.TRASH, sizeUnits = 1.7f, onClick = { viewModel.requestToss() })
+                }
                 LightTopBar(
                     leftButton = LightBarButton.LightIcon(icon = LightIcons.BACK, onClick = { goBack() }),
                     center = LightTopBarCenter.Text("Sudoku"),
+                    rightButton = tossButton,
                 )
 
                 when (val s = state) {
@@ -261,33 +297,92 @@ private fun LimitReachedMessage() {
 
 @Composable
 private fun PlayingContent(state: SudokuUiState.Playing, viewModel: SudokuScreenViewModel) {
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 1f.gridUnitsAsDp())) {
-        LightText(
-            text = if (state.isSolved) "Solved!" else "${state.remainingToday} of ${DailyLimitStore.DEFAULT_DAILY_LIMIT} left today",
-            variant = LightTextVariant.Detail,
-            lighten = !state.isSolved,
-            modifier = Modifier.padding(vertical = 0.5f.gridUnitsAsDp()),
-        )
-
-        // Weighting this box means it only gets whatever height is left over after the
-        // number pad below claims its own (fixed) height - so the board always shrinks
-        // to leave the pad visible and tappable, even on a near-square screen.
-        Box(
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentAlignment = Alignment.Center,
-        ) {
-            SudokuGrid(
-                state = state,
-                onCellClick = { index -> viewModel.selectCell(index) },
-                modifier = Modifier.fillMaxHeight(),
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(modifier = Modifier.fillMaxSize().padding(horizontal = 1f.gridUnitsAsDp())) {
+            LightText(
+                text = if (state.isSolved) "Solved!" else "${state.remainingToday} of ${DailyLimitStore.DEFAULT_DAILY_LIMIT} left today",
+                variant = LightTextVariant.Detail,
+                lighten = !state.isSolved,
+                modifier = Modifier.padding(vertical = 0.5f.gridUnitsAsDp()),
             )
+
+            // Weighting this box means it only gets whatever height is left over after the
+            // number pad below claims its own (fixed) height - so the board always shrinks
+            // to leave the pad visible and tappable, even on a near-square screen.
+            Box(
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                SudokuGrid(
+                    state = state,
+                    onCellClick = { index -> viewModel.selectCell(index) },
+                    modifier = Modifier.fillMaxHeight(),
+                )
+            }
+
+            if (!state.isSolved) {
+                NumberPad(
+                    onDigit = { digit -> viewModel.enterDigit(digit) },
+                    onClear = { viewModel.clearSelected() },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
         }
 
-        if (!state.isSolved) {
-            NumberPad(
-                onDigit = { digit -> viewModel.enterDigit(digit) },
-                onClear = { viewModel.clearSelected() },
+        if (state.showTossConfirm) {
+            TossConfirmOverlay(
+                onConfirm = { viewModel.confirmToss() },
+                onCancel = { viewModel.cancelToss() },
+            )
+        }
+    }
+}
+
+@Composable
+private fun TossConfirmOverlay(onConfirm: () -> Unit, onCancel: () -> Unit) {
+    val colors = LightThemeTokens.colors
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(colors.background.copy(alpha = 0.92f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            LightText(
+                text = "Toss this puzzle?",
+                variant = LightTextVariant.Heading,
+                align = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth(),
+            )
+            LightText(
+                text = "You won't get this attempt back.",
+                variant = LightTextVariant.Detail,
+                lighten = true,
+                align = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 0.5f.gridUnitsAsDp()),
+            )
+            LightText(
+                text = "Toss it",
+                variant = LightTextVariant.Copy,
+                align = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 2f.gridUnitsAsDp())
+                    .lightClickable(onClick = onConfirm)
+                    .padding(vertical = 1f.gridUnitsAsDp()),
+            )
+            LightText(
+                text = "Keep trying",
+                variant = LightTextVariant.Copy,
+                lighten = true,
+                align = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 0.5f.gridUnitsAsDp())
+                    .lightClickable(onClick = onCancel)
+                    .padding(vertical = 1f.gridUnitsAsDp()),
             )
         }
     }
